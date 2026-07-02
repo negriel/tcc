@@ -1,0 +1,15 @@
+Disease,AUC-ROC,Above_Mean
+No Finding,0.8738037622403638,True
+Enlarged Cardiomediastinum,0.587974193527677,False
+Cardiomegaly,0.8067178579687119,True
+Lung Opacity,0.7323729392958024,False
+Lung Lesion,0.7398435512063214,False
+Edema,0.8597234456943275,True
+Consolidation,0.6968453432282005,False
+Pneumonia,0.749318038304553,False
+Atelectasis,0.7199771148774687,False
+Pneumothorax,0.8127364251947894,True
+Pleural Effusion,0.8685132502449324,True
+Pleural Other,0.7952930824933008,True
+Fracture,0.7189690281122367,False
+Support Devices,0.8404832387576857,True
