@@ -26,7 +26,6 @@ from torchvision import models
 
 warnings.filterwarnings("ignore")
 
-# Configurações
 TRAIN_DF_PATH = r"E:\GabrielRibeiro\chexpert_project\data\CheXpert-v1.0-small\train.csv"
 TEST_DF_PATH  = r"E:\GabrielRibeiro\chexpert_project\src\CheXclusion\CXP\testSet_SubjID.csv"
 PATH_IMAGE    = r"E:\GabrielRibeiro\chexpert_project\data"
@@ -254,7 +253,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # Carrega dados
     print("\nCarregando datasets...")
     train_df_full = pd.read_csv(TRAIN_DF_PATH)
     test_indices = pd.read_csv(TEST_DF_PATH, header=None)[0].values
@@ -305,7 +303,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
         persistent_workers=True
     )
 
-    # Modelo
     print("\nConstruindo modelo com fine-tuning progressivo...")
     model = DenseNet121_Regularized(num_classes=N_LABELS, dropout_rate=DROPOUT_RATE)
     model = model.to(device)
@@ -339,7 +336,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
     scaler = GradScaler()
     early_stopping = EarlyStopping(patience=7, delta=0.001)
 
-    # Treinamento
     best_auroc = 0.0
     log_file_path = os.path.join(results_dir, "log_train.csv")
     
@@ -350,7 +346,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
     print("\nIniciando treinamento...")
     
     for epoch in range(NUM_EPOCHS):
-        # Descongelamento progressivo
         current_phase = "Fase 1: Classificador"
         
         if epoch == 10:
@@ -394,7 +389,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
         
         print(f"\nÉpoca {epoch+1}/{NUM_EPOCHS} - {current_phase}")
         
-        # Treino
         model.train()
         running_loss_train = 0.0
         
@@ -416,7 +410,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
 
         epoch_loss_train = running_loss_train / len(train_df)
 
-        # Validação
         model.eval()
         running_loss_val = 0.0
         
@@ -432,7 +425,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
 
         epoch_loss_val = running_loss_val / len(val_df)
 
-        # Métricas
         if epoch % 5 == 0 or epoch == NUM_EPOCHS - 1:
             train_auroc, _ = compute_auroc_fast(model, train_loader, device, N_LABELS)
             val_auroc, _ = compute_auroc_fast(model, val_loader, device, N_LABELS)
