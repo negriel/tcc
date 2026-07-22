@@ -1,6 +1,13 @@
 """
 Pipeline de fine-tuning progressivo para CheXpert.
 Descongelamento gradual de camadas da DenseNet-121 em 3 fases.
+
+Correcoes desta versao (ver notas no fim do arquivo):
+- Remove o conjunto de teste orfao do CheXclusion, que era carregado e nunca usado.
+- Exclui o conjunto de teste comum (common_test_set.csv) do pool ANTES de
+  amostrar os 100k de treino, garantindo que nenhum modelo veja essas imagens.
+- Calcula AUC de validacao a cada epoca (nao a cada 5), para que o checkpoint
+  do "melhor modelo" seja de fato o melhor de todas as epocas.
 """
 
 import os
@@ -25,8 +32,11 @@ from torchvision import models
 warnings.filterwarnings("ignore")
 
 TRAIN_DF_PATH = r"E:\GabrielRibeiro\chexpert_project\data\CheXpert-v1.0-small\train.csv"
-TEST_DF_PATH  = r"E:\GabrielRibeiro\chexpert_project\src\CheXclusion\CXP\testSet_SubjID.csv"
 PATH_IMAGE    = r"E:\GabrielRibeiro\chexpert_project\data"
+# Conjunto de teste comum, gerado por prepare_split.py. Reservado; nenhum
+# modelo treina nele. Usado depois por analyze_ensemble / analyze_fairness /
+# quantize_model.
+COMMON_TEST_PATH = os.path.join('..', 'results_ensemble', 'common_test_set.csv')
 
 DISEASES = [
     'No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity',
@@ -172,6 +182,30 @@ def get_transforms():
     return train_transform, val_transform
 
 
+def load_pool_excluding_test(train_df_path, common_test_path):
+    """
+    Carrega o train.csv completo e remove as imagens do conjunto de teste comum.
+    Retorna o pool de treino/validacao livre de vazamento.
+    """
+    df = pd.read_csv(train_df_path)
+    if 'path' in df.columns:
+        df.rename(columns={'path': 'Path'}, inplace=True)
+
+    if not os.path.exists(common_test_path):
+        raise FileNotFoundError(
+            f"Conjunto de teste comum nao encontrado em {common_test_path}. "
+            f"Rode prepare_split.py primeiro."
+        )
+
+    test_paths = set(pd.read_csv(common_test_path)['Path'].tolist())
+    pool = df[~df['Path'].isin(test_paths)].reset_index(drop=True)
+
+    n_removed = len(df) - len(pool)
+    print(f"Pool apos remover teste comum: {len(pool):,} imagens "
+          f"({n_removed:,} reservadas para teste)")
+    return pool
+
+
 def plot_learning_curves(log_path, output_path):
     if not os.path.exists(log_path):
         print(f"Arquivo '{log_path}' não encontrado.")
@@ -238,16 +272,12 @@ def train_model(random_seed, results_dir, debug_mode=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo: {device} | Seed: {random_seed}")
 
-    train_df_full = pd.read_csv(TRAIN_DF_PATH)
-    test_indices = pd.read_csv(TEST_DF_PATH, header=None)[0].values
-    test_df = train_df_full.iloc[test_indices].copy().reset_index(drop=True)
-
-    for df in [train_df_full, test_df]:
-        if 'path' in df.columns:
-            df.rename(columns={'path': 'Path'}, inplace=True)
+    # Pool de treino/validacao ja SEM as imagens do conjunto de teste comum.
+    pool = load_pool_excluding_test(TRAIN_DF_PATH, COMMON_TEST_PATH)
 
     n_sample = 1000 if debug_mode else 100000
-    train_df_full = train_df_full.sample(n=n_sample, random_state=random_seed).reset_index(drop=True)
+    n_sample = min(n_sample, len(pool))
+    train_df_full = pool.sample(n=n_sample, random_state=random_seed).reset_index(drop=True)
 
     stratify_col = (train_df_full['Cardiomegaly'] == 1.0).astype(int)
     train_df, val_df = train_test_split(
@@ -317,7 +347,6 @@ def train_model(random_seed, results_dir, debug_mode=False):
             )
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"Fase 2 — parâmetros treináveis: {trainable:,} ({100 * trainable / total:.1f}%), LR 3e-5")
-            current_phase = "Fase 2: + DenseBlocks"
 
         if epoch == 20:
             for param in model.parameters():
@@ -325,7 +354,13 @@ def train_model(random_seed, results_dir, debug_mode=False):
 
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=WEIGHT_DECAY)
             print("Fase 3 — todas as camadas desbloqueadas, LR 1e-5")
+
+        # Rotulo de fase correto e persistente (corrige o bug do log antigo,
+        # que voltava a marcar "Fase 1" nas epocas intermediarias).
+        if epoch >= 20:
             current_phase = "Fase 3: Full Fine-Tuning"
+        elif epoch >= 10:
+            current_phase = "Fase 2: + DenseBlocks"
 
         model.train()
         running_loss_train = 0.0
@@ -361,24 +396,24 @@ def train_model(random_seed, results_dir, debug_mode=False):
 
         epoch_loss_val = running_loss_val / len(val_df)
 
-        if epoch % 5 == 0 or epoch == NUM_EPOCHS - 1:
-            train_auroc, _ = compute_auroc_fast(model, train_loader, device, N_LABELS)
-            val_auroc, _ = compute_auroc_fast(model, val_loader, device, N_LABELS)
-        else:
-            train_auroc, val_auroc = 0.0, 0.0
+        # AUC calculado TODA epoca, para que o checkpoint do melhor modelo
+        # seja realmente o melhor de todas as epocas, e nao apenas das
+        # multiplas de 5 (bug da versao anterior).
+        train_auroc, _ = compute_auroc_fast(model, train_loader, device, N_LABELS)
+        val_auroc, _ = compute_auroc_fast(model, val_loader, device, N_LABELS)
 
         scheduler.step(epoch_loss_val)
 
         print(f"Época {epoch + 1} [{current_phase}] "
               f"Loss treino/val: {epoch_loss_train:.4f}/{epoch_loss_val:.4f}"
-              + (f" | AUC treino/val: {train_auroc:.4f}/{val_auroc:.4f}" if train_auroc > 0 else ""))
+              f" | AUC treino/val: {train_auroc:.4f}/{val_auroc:.4f}")
 
         with open(log_file_path, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([epoch, epoch_loss_train, epoch_loss_val, train_auroc, val_auroc,
                               optimizer.param_groups[0]['lr'], current_phase])
 
-        if val_auroc > best_auroc and val_auroc > 0:
+        if val_auroc > best_auroc:
             best_auroc = val_auroc
             checkpoint = {
                 'epoch': epoch,
@@ -414,3 +449,23 @@ if __name__ == "__main__":
         debug_mode=False
     )
     print(f"Resultado final: AUC {result['best_auroc']:.4f}")
+
+# ==============================================================================
+# NOTAS DE CORRECAO (para referencia; remover se nao quiser no codigo final)
+#
+# 1. Removidos TEST_DF_PATH e o bloco que carregava test_indices / test_df do
+#    CheXclusion. Esse conjunto era montado e nunca usado, e como o sample()
+#    era feito sem exclui-lo, seu uso teria causado vazamento.
+#
+# 2. Adicionada load_pool_excluding_test(): o pool de treino/validacao agora
+#    exclui explicitamente as imagens do common_test_set.csv antes de amostrar
+#    os 100k. Isso garante que o conjunto de teste comum e' inedito para os
+#    5 modelos.
+#
+# 3. AUC agora e' calculado toda epoca (antes: so em epoch % 5 == 0). O
+#    checkpoint do melhor modelo era enviesado para epocas multiplas de 5;
+#    agora reflete o melhor AUC de validacao de qualquer epoca.
+#
+# 4. Corrigido o rotulo da coluna 'phase' no log, que na versao anterior
+#    voltava a marcar "Fase 1" nas epocas intermediarias.
+# ==============================================================================

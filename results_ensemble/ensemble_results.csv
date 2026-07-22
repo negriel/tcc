@@ -1,15 +1,15 @@
-Disease,AUC-ROC,Above_Mean
-No Finding,0.8738037622403638,True
-Enlarged Cardiomediastinum,0.587974193527677,False
-Cardiomegaly,0.8067178579687119,True
-Lung Opacity,0.7323729392958024,False
-Lung Lesion,0.7398435512063214,False
-Edema,0.8597234456943275,True
-Consolidation,0.6968453432282005,False
-Pneumonia,0.749318038304553,False
-Atelectasis,0.7199771148774687,False
-Pneumothorax,0.8127364251947894,True
-Pleural Effusion,0.8685132502449324,True
-Pleural Other,0.7952930824933008,True
-Fracture,0.7189690281122367,False
-Support Devices,0.8404832387576857,True
+Disease,AUC-ROC,Competition_Task
+No Finding,0.8748643844522894,False
+Enlarged Cardiomediastinum,0.6037846045268942,False
+Cardiomegaly,0.808307299261885,True
+Lung Opacity,0.7217729054277604,False
+Lung Lesion,0.7480135930377124,False
+Edema,0.8479307706072379,True
+Consolidation,0.6808167028651507,True
+Pneumonia,0.7401477985131064,False
+Atelectasis,0.7101619810845634,True
+Pneumothorax,0.8077192876637882,False
+Pleural Effusion,0.8609923893217378,True
+Pleural Other,0.7892194431510451,False
+Fracture,0.7044676626397609,False
+Support Devices,0.8347453168555375,False

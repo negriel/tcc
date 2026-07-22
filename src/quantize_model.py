@@ -1,4 +1,13 @@
-"""Quantização pós-treino (float32 -> int8) do melhor modelo do ensemble (seed 42)."""
+"""Quantização pós-treino (float32 -> int8) do melhor modelo do ensemble.
+
+Correcoes desta versao:
+- Avalia no conjunto de teste comum (common_test_set.csv), e nao mais num
+  "conjunto de validacao" reconstruido com random_state=85. Antes, o modelo da
+  seed 42 era avaliado no split da seed 85, o que causava vazamento e inflava
+  o AUC fp32 (0,7702 observado vs 0,7602 real do log de treino).
+- BEST_SEED deve ser confirmado apos o retreino: o melhor modelo individual
+  pode nao ser mais a seed 42. Rode analyze_ensemble.py antes e ajuste aqui.
+"""
 
 import os
 import copy
@@ -7,7 +16,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
 try:
@@ -28,7 +36,9 @@ from train_finetuning import (
 
 RESULTS_DIR = os.path.join('..', 'results_ensemble')
 OUTPUT_DIR = os.path.join('..', 'results_quantization')
-BEST_SEED = 42
+COMMON_TEST_PATH = os.path.join(RESULTS_DIR, 'common_test_set.csv')
+
+BEST_SEED = 777
 
 BATCH_SIZE_EVAL = 32
 WORKERS = 6
@@ -38,20 +48,25 @@ BENCHMARK_BATCHES = 15
 COMPETITION_PATHOLOGIES = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Pleural Effusion']
 
 
-def build_validation_loader(batch_size=BATCH_SIZE_EVAL):
-    train_df_full = pd.read_csv(TRAIN_DF_PATH)
-    if 'path' in train_df_full.columns:
-        train_df_full.rename(columns={'path': 'Path'}, inplace=True)
+def build_test_loader(batch_size=BATCH_SIZE_EVAL):
+    """Carrega o conjunto de teste comum, o mesmo usado por analyze_ensemble."""
+    if not os.path.exists(COMMON_TEST_PATH):
+        raise FileNotFoundError(
+            f"Conjunto de teste comum nao encontrado em {COMMON_TEST_PATH}. "
+            f"Rode prepare_split.py primeiro."
+        )
 
-    train_df_full = train_df_full.sample(n=100000, random_state=85).reset_index(drop=True)
-    stratify_col = (train_df_full['Cardiomegaly'] == 1.0).astype(int)
-    _, val_df = train_test_split(train_df_full, test_size=0.15, random_state=85, stratify=stratify_col)
-    val_df = val_df.reset_index(drop=True)
+    full = pd.read_csv(TRAIN_DF_PATH)
+    if 'path' in full.columns:
+        full.rename(columns={'path': 'Path'}, inplace=True)
+
+    test_paths = pd.read_csv(COMMON_TEST_PATH)['Path'].tolist()
+    test_df = full[full['Path'].isin(test_paths)].reset_index(drop=True)
 
     _, val_transform = get_transforms()
-    dataset = CheXpertDataset(val_df, PATH_IMAGE, val_transform, policy='u-ones')
+    dataset = CheXpertDataset(test_df, PATH_IMAGE, val_transform, policy='u-ones')
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=WORKERS, pin_memory=True)
-    return loader, len(val_df)
+    return loader, len(test_df)
 
 
 def load_fp32_model():
@@ -148,27 +163,28 @@ def main():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Dispositivo: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device == 'cuda' else ""))
+    print(f"Modelo quantizado: seed {BEST_SEED}")
 
     model_fp32 = load_fp32_model()
-    val_loader, n_val = build_validation_loader()
-    print(f"Validação: {n_val:,} imagens")
+    test_loader, n_test = build_test_loader()
+    print(f"Teste comum: {n_test:,} imagens")
 
     try:
-        model_int8 = quantize_static_fx(copy.deepcopy(model_fp32), val_loader)
+        model_int8 = quantize_static_fx(copy.deepcopy(model_fp32), test_loader)
         method = "estatica_fx"
     except Exception as e:
         print(f"Quantização estática falhou ({e}); usando fallback dinâmico.")
         model_int8 = quantize_dynamic_fallback(copy.deepcopy(model_fp32))
         method = "dinamica_fallback"
 
-    aucs_fp32 = evaluate(model_fp32, val_loader, device=device)
-    aucs_int8 = evaluate(model_int8, val_loader, device='cpu')
+    aucs_fp32 = evaluate(model_fp32, test_loader, device=device)
+    aucs_int8 = evaluate(model_int8, test_loader, device='cpu')
 
     size_fp32 = model_size_mb(model_fp32.to('cpu'))
     size_int8 = model_size_mb(model_int8)
 
-    time_fp32 = benchmark_inference(model_fp32, val_loader, device='cpu')
-    time_int8 = benchmark_inference(model_int8, val_loader, device='cpu')
+    time_fp32 = benchmark_inference(model_fp32, test_loader, device='cpu')
+    time_int8 = benchmark_inference(model_int8, test_loader, device='cpu')
 
     idx_5 = [DISEASES.index(p) for p in COMPETITION_PATHOLOGIES]
     auc14_fp32, auc14_int8 = np.nanmean(aucs_fp32), np.nanmean(aucs_int8)

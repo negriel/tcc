@@ -1,6 +1,6 @@
 """
-Análise do ensemble de 5 modelos: carrega os checkpoints treinados
-e calcula a performance combinada no conjunto de validação.
+Análise do ensemble de 5 modelos: carrega os checkpoints treinados e calcula
+a performance combinada no CONJUNTO DE TESTE COMUM (common_test_set.csv).
 """
 
 import os
@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from torchvision import models
 import torchvision.transforms as transforms
@@ -20,12 +19,15 @@ from PIL import Image
 RESULTS_DIR = os.path.join('..', 'results_ensemble')
 PATH_IMAGE = r"E:\GabrielRibeiro\chexpert_project\data"
 TRAIN_DF_PATH = r"E:\GabrielRibeiro\chexpert_project\data\CheXpert-v1.0-small\train.csv"
+COMMON_TEST_PATH = os.path.join(RESULTS_DIR, 'common_test_set.csv')
 
 DISEASES = [
     'No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity',
     'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis',
     'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices'
 ]
+
+COMPETITION_PATHOLOGIES = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Pleural Effusion']
 
 
 class DenseNet121_Regularized(nn.Module):
@@ -83,6 +85,55 @@ class CheXpertDataset(torch.utils.data.Dataset):
         return len(self.dataframe)
 
 
+def load_common_test_df():
+    """Carrega o conjunto de teste comum e junta com os rotulos do train.csv."""
+    if not os.path.exists(COMMON_TEST_PATH):
+        raise FileNotFoundError(
+            f"Conjunto de teste comum nao encontrado em {COMMON_TEST_PATH}. "
+            f"Rode prepare_split.py primeiro."
+        )
+
+    full = pd.read_csv(TRAIN_DF_PATH)
+    if 'path' in full.columns:
+        full.rename(columns={'path': 'Path'}, inplace=True)
+
+    test_paths = pd.read_csv(COMMON_TEST_PATH)['Path'].tolist()
+    test_df = full[full['Path'].isin(test_paths)].reset_index(drop=True)
+    return test_df
+
+
+def evaluate_single(model, data_loader, device, num_classes=14):
+    """Avalia UM modelo isolado. Retorna (AUC-14 medio, AUC-5 medio, lista de AUCs)."""
+    all_labels = []
+    all_probs = []
+
+    with torch.no_grad():
+        for imgs, labels, _ in data_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                outputs = model(imgs)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            all_labels.append(labels.numpy())
+            all_probs.append(probs)
+
+    all_labels = np.vstack(all_labels)
+    all_probs = np.vstack(all_probs)
+
+    aucs = []
+    for i in range(num_classes):
+        if len(np.unique(all_labels[:, i])) > 1:
+            try:
+                aucs.append(roc_auc_score(all_labels[:, i], all_probs[:, i]))
+            except ValueError:
+                aucs.append(0.5)
+        else:
+            aucs.append(0.5)
+
+    idx_5 = [DISEASES.index(p) for p in COMPETITION_PATHOLOGIES]
+    auc5 = np.mean([aucs[i] for i in idx_5])
+    return np.mean(aucs), auc5, aucs
+
+
 def evaluate_ensemble(models, data_loader, device, num_classes=14):
     """Avalia o ensemble fazendo a média das predições de todos os modelos."""
     all_labels = []
@@ -135,7 +186,7 @@ def plot_results(mean_auroc, aurocs, diseases, output_dir):
                 f'{auc:.3f}', va='center', ha='left', fontsize=9, fontweight='bold')
 
     ax.set_xlabel('AUC-ROC', fontsize=13, fontweight='bold')
-    ax.set_title(f'Performance do Ensemble de 5 Modelos por Doença\nAUC-ROC Médio: {mean_auroc:.4f}',
+    ax.set_title(f'Performance do Ensemble de 5 Modelos por Doença\nAUC-ROC Médio (14 patologias): {mean_auroc:.4f}',
                  fontsize=15, fontweight='bold', pad=20)
     ax.set_xlim(0.5, 1.0)
     ax.legend(loc='lower right', fontsize=11)
@@ -150,7 +201,6 @@ def plot_results(mean_auroc, aurocs, diseases, output_dir):
 def main():
     BATCH_SIZE = 64
     WORKERS = 6
-    RANDOM_SEED = 85
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo: {device}")
@@ -158,20 +208,8 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)} "
               f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)")
 
-    train_df_full = pd.read_csv(TRAIN_DF_PATH)
-    if 'path' in train_df_full.columns:
-        train_df_full.rename(columns={'path': 'Path'}, inplace=True)
-
-    train_df_full = train_df_full.sample(n=100000, random_state=RANDOM_SEED).reset_index(drop=True)
-    stratify_col = (train_df_full['Cardiomegaly'] == 1.0).astype(int)
-    _, val_df = train_test_split(
-        train_df_full,
-        test_size=0.15,
-        random_state=RANDOM_SEED,
-        stratify=stratify_col
-    )
-    val_df = val_df.reset_index(drop=True)
-    print(f"Validação: {len(val_df):,} imagens")
+    test_df = load_common_test_df()
+    print(f"Conjunto de teste comum: {len(test_df):,} imagens")
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     val_transform = transforms.Compose([
@@ -181,9 +219,9 @@ def main():
         normalize
     ])
 
-    val_dataset = CheXpertDataset(val_df, PATH_IMAGE, val_transform, policy='u-ones')
-    val_loader = DataLoader(
-        val_dataset,
+    test_dataset = CheXpertDataset(test_df, PATH_IMAGE, val_transform, policy='u-ones')
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=WORKERS,
@@ -192,8 +230,8 @@ def main():
     )
 
     seeds = [85, 42, 123, 777, 999]
-    models = []
-    individual_aucs = []
+    models_list = []
+    per_model_rows = []  # AUCs de cada modelo isolado, medidos NO TESTE COMUM
 
     for seed in seeds:
         model_path = os.path.join(RESULTS_DIR, f"model_seed_{seed}", "best_model.pt")
@@ -206,62 +244,82 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
         model.eval()
+        models_list.append(model)
 
-        auc = checkpoint.get('best_auroc', 'N/A')
         epoch = checkpoint.get('epoch', 'N/A')
-        print(f"Seed {seed:3d}: AUC {auc:.4f} (época {epoch})"
-              if isinstance(auc, (int, float)) else f"Seed {seed:3d}: {auc}")
-        models.append(model)
-        if isinstance(auc, (int, float)):
-            individual_aucs.append(auc)
+        val_auc = checkpoint.get('best_auroc', float('nan'))  # do split interno
 
-    if len(models) != 5:
-        print(f"Apenas {len(models)}/5 modelos carregados. Verifique {RESULTS_DIR}")
+        # Avalia o modelo isolado NO TESTE COMUM, para comparacao justa com o ensemble.
+        single_auc14, single_auc5, _ = evaluate_single(model, test_loader, device)
+        per_model_rows.append({
+            'Seed': seed,
+            'Epoch': epoch,
+            'AUC_14_val_interna': val_auc,   # referencia de convergencia
+            'AUC_14_teste_comum': single_auc14,
+            'AUC_5_teste_comum': single_auc5,
+        })
+        print(f"Seed {seed:3d}: teste comum AUC-14 {single_auc14:.4f} | "
+              f"AUC-5 {single_auc5:.4f} (época {epoch})")
+
+    if len(models_list) != 5:
+        print(f"Apenas {len(models_list)}/5 modelos carregados. Verifique {RESULTS_DIR}")
         return
 
-    mean_auroc, aurocs, diseases = evaluate_ensemble(models, val_loader, device)
+    mean_auroc, aurocs, diseases = evaluate_ensemble(models_list, test_loader, device)
 
-    print(f"\nAUC-ROC médio do ensemble: {mean_auroc:.4f}")
+    # AUC-5: subconjunto da competition task, para comparacao com a literatura.
+    idx_5 = [DISEASES.index(p) for p in COMPETITION_PATHOLOGIES]
+    auc5 = np.mean([aurocs[i] for i in idx_5])
+
+    print(f"\nAUC-ROC médio do ensemble (14 patologias): {mean_auroc:.4f}")
+    print(f"AUC-ROC médio do ensemble (5 patologias, competition task): {auc5:.4f}")
     for disease, auc in zip(diseases, aurocs):
-        marker = "*" if auc >= mean_auroc else " "
+        marker = "*" if disease in COMPETITION_PATHOLOGIES else " "
         print(f"{marker} {disease:32s}: {auc:.4f}")
 
     results_df = pd.DataFrame({
         'Disease': diseases,
         'AUC-ROC': aurocs,
-        'Above_Mean': [auc >= mean_auroc for auc in aurocs]
+        'Competition_Task': [d in COMPETITION_PATHOLOGIES for d in diseases]
     })
     results_df.to_csv(os.path.join(RESULTS_DIR, 'ensemble_results.csv'), index=False)
 
     plot_results(mean_auroc, aurocs, diseases, RESULTS_DIR)
 
+    # Tabela por modelo individual (AUCs no teste comum) — base da Tabela 4/5 do TCC.
+    per_model_df = pd.DataFrame(per_model_rows)
+    per_model_df.to_csv(os.path.join(RESULTS_DIR, 'individual_results.csv'), index=False)
+
+    # Comparacao individual vs ensemble, agora TODA medida no teste comum.
+    ind_14 = per_model_df['AUC_14_teste_comum'].values
+    mean_ind_14 = float(np.mean(ind_14))
+    best_ind_14 = float(np.max(ind_14))
+    best_seed = int(per_model_df.loc[per_model_df['AUC_14_teste_comum'].idxmax(), 'Seed'])
+    ganho_sobre_media = mean_auroc - mean_ind_14
+    ganho_sobre_melhor = mean_auroc - best_ind_14
+
     summary_df = pd.DataFrame([{
-        'Mean_AUC': mean_auroc,
-        'Std_AUC': np.std(aurocs),
-        'Min_AUC': np.min(aurocs),
-        'Max_AUC': np.max(aurocs),
-        'Median_AUC': np.median(aurocs),
-        'Num_Models': len(models),
-        'Num_Diseases': len(diseases)
+        'Mean_AUC_14_ensemble': mean_auroc,
+        'Mean_AUC_5_ensemble': auc5,
+        'Mean_AUC_14_individual': mean_ind_14,
+        'Best_AUC_14_individual': best_ind_14,
+        'Best_seed': best_seed,
+        'Std_AUC_14_individual': float(np.std(ind_14)),
+        'Ganho_sobre_media': ganho_sobre_media,
+        'Ganho_sobre_melhor': ganho_sobre_melhor,
+        'Num_Models': len(models_list),
     }])
     summary_df.to_csv(os.path.join(RESULTS_DIR, 'ensemble_summary.csv'), index=False)
 
-    if individual_aucs:
-        mean_individual = np.mean(individual_aucs)
-        ganho = mean_auroc - mean_individual
-        print(f"\nMédia individual: {mean_individual:.4f} (desvio {np.std(individual_aucs):.4f})")
-        print(f"Ensemble: {mean_auroc:.4f} | Ganho: +{ganho:.4f} ({100 * ganho / mean_individual:.1f}%)")
-    else:
-        print("\nAUCs individuais não disponíveis nos checkpoints — pulando comparação.")
-
-    top_5_idx = np.argsort(aurocs)[-5:][::-1]
-    bottom_5_idx = np.argsort(aurocs)[:5]
-    print("\nMelhores patologias:")
-    for idx in top_5_idx:
-        print(f"  {diseases[idx]:32s}: {aurocs[idx]:.4f}")
-    print("Piores patologias:")
-    for idx in bottom_5_idx:
-        print(f"  {diseases[idx]:32s}: {aurocs[idx]:.4f}")
+    print(f"\n--- Comparacao (tudo no teste comum) ---")
+    print(f"Média individual (AUC-14): {mean_ind_14:.4f} (desvio {np.std(ind_14):.4f})")
+    print(f"Melhor individual (AUC-14): {best_ind_14:.4f} (seed {best_seed})")
+    print(f"Ensemble (AUC-14): {mean_auroc:.4f}")
+    print(f"Ganho do ensemble sobre a média individual: {ganho_sobre_media:+.4f} "
+          f"({100 * ganho_sobre_media / mean_ind_14:+.1f}%)")
+    print(f"Ganho do ensemble sobre o melhor individual: {ganho_sobre_melhor:+.4f}")
+    print(f"\nMelhor seed para quantizar: {best_seed} "
+          f"(ajuste BEST_SEED em quantize_model.py se necessario)")
 
     print(f"\nResultados salvos em: {RESULTS_DIR}/")
 
